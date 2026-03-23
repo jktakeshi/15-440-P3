@@ -1,7 +1,5 @@
-all: Server.class
-
-%.class: %.java
-	javac $<
+all:
+	javac *.java
 
 clean:
 	rm -f *.class
