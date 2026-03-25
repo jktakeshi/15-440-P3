@@ -23,11 +23,9 @@ public class Server {
 			SL.register_frontend();
 
 			List<Integer> appVMs = Collections.synchronizedList(new ArrayList<>());
+			List<Integer> feVMs = Collections.synchronizedList(new ArrayList<>());
 
-			int feId = SL.startVM();
-			coordinator.assignRole(feId, "FRONTEND");
-
-			for (int i = 0; i < 6; i++) {
+			for (int i = 0; i < 2; i++) {
 				int id = SL.startVM();
 				coordinator.assignRole(id, "APP");
 				appVMs.add(id);
@@ -35,7 +33,7 @@ public class Server {
 
 			Thread scaler = new Thread(() -> {
 				try {
-					scaleLoop(SL, coordinator, appVMs);
+					scaleLoop(SL, coordinator, appVMs, feVMs);
 				} catch (Exception e) {
 				}
 			});
@@ -45,12 +43,7 @@ public class Server {
 			while (true) {
 				ServerLib.Handle h = SL.acceptConnection();
 				Cloud.FrontEndOps.Request r = SL.parseRequest(h);
-
-				if (coordinator.getReadyAppCount() == 0) {
-					SL.processRequest(r);
-				} else {
-					coordinator.submitRequest(r);
-				}
+				coordinator.submitRequest(r);
 			}
 		} else {
 			CoordinatorInterface coordinator = lookupCoordinator(registry);
@@ -81,13 +74,15 @@ public class Server {
 		}
 	}
 
-	private static void scaleLoop(ServerLib SL, Coordinator coordinator, List<Integer> appVMs)
-			throws Exception {
-		int minApps = 3;
-		int maxApps = 10;
+	private static void scaleLoop(ServerLib SL, Coordinator coordinator,
+			List<Integer> appVMs, List<Integer> feVMs) throws Exception {
+		int minApps = 1;
+		int maxApps = 6;
 		long lastScaleUp = 0;
+		long lastFeScaleUp = 0;
 		int prevSubmitted = 0;
 		int consecutiveLowUtil = 0;
+		boolean addedExtraFE = false;
 
 		while (true) {
 			Thread.sleep(500);
@@ -104,6 +99,14 @@ public class Server {
 
 			int totalPending = appQueueSize + feQueueLength;
 
+			if (!addedExtraFE && feQueueLength > 2 && (now - lastFeScaleUp > 2000)) {
+				int feId = SL.startVM();
+				coordinator.assignRole(feId, "FRONTEND");
+				feVMs.add(feId);
+				addedExtraFE = true;
+				lastFeScaleUp = now;
+			}
+
 			if (totalPending > 2 && appVMs.size() < maxApps && (now - lastScaleUp > 500)) {
 				int targetApps = appVMs.size() + 1;
 				if (ratePerSecond > 0) {
@@ -112,7 +115,7 @@ public class Server {
 				targetApps = Math.min(targetApps, maxApps);
 
 				int appsToAdd = Math.max(1, targetApps - appVMs.size());
-				appsToAdd = Math.min(appsToAdd, 4);
+				appsToAdd = Math.min(appsToAdd, 3);
 
 				for (int i = 0; i < appsToAdd; i++) {
 					int newId = SL.startVM();
@@ -126,7 +129,7 @@ public class Server {
 				double capacity = readyApps * 3.0;
 				if (capacity > 0 && ratePerSecond < capacity * 0.5) {
 					consecutiveLowUtil++;
-					if (consecutiveLowUtil > 10) {
+					if (consecutiveLowUtil > 4) {
 						int numToRemove = Math.min(2, appVMs.size() - minApps);
 						for (int i = 0; i < numToRemove; i++) {
 							int vmToRemove = appVMs.remove(appVMs.size() - 1);
@@ -138,7 +141,7 @@ public class Server {
 					}
 				} else if (capacity > 0 && ratePerSecond < capacity * 0.7) {
 					consecutiveLowUtil++;
-					if (consecutiveLowUtil > 20) {
+					if (consecutiveLowUtil > 8) {
 						int vmToRemove = appVMs.remove(appVMs.size() - 1);
 						coordinator.markForShutdown(vmToRemove);
 						coordinator.decrementReadyApps();
