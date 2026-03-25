@@ -1,108 +1,166 @@
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 public class Server {
 
-	// private static int hourToServers(int hour) {
-	// 	if (hour < 1) return 3;
-	// 	if (hour < 5) return 2;   
-	// 	if (hour < 8) return 3;   
-	// 	if (hour < 15) return 5;     
-	// 	if (hour < 18) return 4; 
-	// 	if (hour < 19) return 5;
-	// 	if (hour < 20) return 6;
-	// 	if (hour < 22) return 7;
-	// 	if (hour < 23) return 5;  
-    // 	return 4;  
-	// }
-
-
-
-	public static void main ( String args[] ) throws Exception {
-		// Cloud class will start one instance of this Server intially [runs as separate process]
-		// It starts another for every startVM call [each a seperate process]
-		// Server will be provided 3 command line arguments
+	public static void main(String args[]) throws Exception {
 		if (args.length != 3) throw new Exception("Need 3 args: <cloud_ip> <cloud_port> <VM id>");
-		
-		// Initialize ServerLib.  Almost all server and cloud operations are done 
-		// through the methods of this class.  Please refer to the html documentation in ../doc
+
 		String cloudIp = args[0];
 		int cloudPort = Integer.parseInt(args[1]);
 		ServerLib SL = new ServerLib(cloudIp, cloudPort);
 		int myVMid = Integer.parseInt(args[2]);
 
 		Registry registry = LocateRegistry.getRegistry(cloudIp, cloudPort);
-		
-		// register with load balancer so client connections are sent to this server
-		// SL.register_frontend();
 
 		if (myVMid == 1) {
 			Coordinator coordinator = new Coordinator();
+			coordinator.setServerLib(SL);
 			registry.rebind("Coordinator", coordinator);
-
 			SL.register_frontend();
 
-			// int appId1 = SL.startVM();
-            // coordinator.assignRole(appId1, "FRONTEND");
+			List<Integer> appVMs = Collections.synchronizedList(new ArrayList<>());
 
-            int appId2 = SL.startVM();
-            coordinator.assignRole(appId2, "APP");
+			int feId = SL.startVM();
+			coordinator.assignRole(feId, "FRONTEND");
 
-			int appId3 = SL.startVM();
-            coordinator.assignRole(appId3, "APP");
+			for (int i = 0; i < 6; i++) {
+				int id = SL.startVM();
+				coordinator.assignRole(id, "APP");
+				appVMs.add(id);
+			}
 
-			int appId4 = SL.startVM();
-            coordinator.assignRole(appId4, "FRONTEND");
-
-			// int appId5 = SL.startVM();
-            // coordinator.assignRole(appId5, "APP");
+			Thread scaler = new Thread(() -> {
+				try {
+					scaleLoop(SL, coordinator, appVMs);
+				} catch (Exception e) {
+				}
+			});
+			scaler.setDaemon(true);
+			scaler.start();
 
 			while (true) {
-				// wait for and accept next client connection, returns a connection handle
 				ServerLib.Handle h = SL.acceptConnection();
-				// read and parse request from client connection at the given handle
-				Cloud.FrontEndOps.Request r = SL.parseRequest( h );
+				Cloud.FrontEndOps.Request r = SL.parseRequest(h);
 
-				if (coordinator.hasReadyApp()) {
+				if (coordinator.getReadyAppCount() == 0) {
+					SL.processRequest(r);
+				} else {
 					coordinator.submitRequest(r);
 				}
-				else {
-					SL.processRequest( r );
-				}
 			}
-		}
-		else {
+		} else {
 			CoordinatorInterface coordinator = lookupCoordinator(registry);
 			String role = coordinator.getRole(myVMid);
 
 			if ("FRONTEND".equals(role)) {
 				SL.register_frontend();
-				
 				while (true) {
-                    ServerLib.Handle h = SL.acceptConnection();
-                    Cloud.FrontEndOps.Request r = SL.parseRequest(h);
-                    coordinator.submitRequest(r);
-                }
-			}
-			else if ("APP".equals(role)) {
-				while (true) {
-                    Cloud.FrontEndOps.Request r = coordinator.getNextRequest();
-                    if (r != null) {
-                        SL.processRequest(r);
-                    }
+					ServerLib.Handle h = SL.acceptConnection();
+					Cloud.FrontEndOps.Request r = SL.parseRequest(h);
+					coordinator.submitRequest(r);
 				}
+			} else if ("APP".equals(role)) {
+				try {
+					while (true) {
+						if (coordinator.shouldShutdown(myVMid)) {
+							break;
+						}
+						Cloud.FrontEndOps.Request r = coordinator.getNextRequest();
+						if (r != null) {
+							SL.processRequest(r);
+						}
+					}
+				} catch (java.rmi.RemoteException e) {
+				}
+				SL.shutDown();
+			}
+		}
+	}
+
+	private static void scaleLoop(ServerLib SL, Coordinator coordinator, List<Integer> appVMs)
+			throws Exception {
+		int minApps = 3;
+		int maxApps = 10;
+		long lastScaleUp = 0;
+		int prevSubmitted = 0;
+		int consecutiveLowUtil = 0;
+
+		while (true) {
+			Thread.sleep(500);
+
+			int appQueueSize = coordinator.getLocalQueueSize();
+			int feQueueLength = SL.getQueueLength();
+			int readyApps = coordinator.getReadyAppCount();
+			long now = System.currentTimeMillis();
+
+			int nowSubmitted = coordinator.getTotalSubmitted();
+			int delta = nowSubmitted - prevSubmitted;
+			prevSubmitted = nowSubmitted;
+			double ratePerSecond = delta * 2.0;
+
+			int totalPending = appQueueSize + feQueueLength;
+
+			if (totalPending > 2 && appVMs.size() < maxApps && (now - lastScaleUp > 500)) {
+				int targetApps = appVMs.size() + 1;
+				if (ratePerSecond > 0) {
+					targetApps = Math.max(targetApps, (int)(ratePerSecond / 3.0) + 1);
+				}
+				targetApps = Math.min(targetApps, maxApps);
+
+				int appsToAdd = Math.max(1, targetApps - appVMs.size());
+				appsToAdd = Math.min(appsToAdd, 4);
+
+				for (int i = 0; i < appsToAdd; i++) {
+					int newId = SL.startVM();
+					coordinator.assignRole(newId, "APP");
+					appVMs.add(newId);
+				}
+				lastScaleUp = now;
+				consecutiveLowUtil = 0;
+			} else if (nowSubmitted > 0 && appQueueSize == 0 && feQueueLength == 0
+					&& appVMs.size() > minApps && readyApps > minApps) {
+				double capacity = readyApps * 3.0;
+				if (capacity > 0 && ratePerSecond < capacity * 0.5) {
+					consecutiveLowUtil++;
+					if (consecutiveLowUtil > 10) {
+						int numToRemove = Math.min(2, appVMs.size() - minApps);
+						for (int i = 0; i < numToRemove; i++) {
+							int vmToRemove = appVMs.remove(appVMs.size() - 1);
+							coordinator.markForShutdown(vmToRemove);
+							coordinator.decrementReadyApps();
+							SL.endVM(vmToRemove);
+						}
+						consecutiveLowUtil = 0;
+					}
+				} else if (capacity > 0 && ratePerSecond < capacity * 0.7) {
+					consecutiveLowUtil++;
+					if (consecutiveLowUtil > 20) {
+						int vmToRemove = appVMs.remove(appVMs.size() - 1);
+						coordinator.markForShutdown(vmToRemove);
+						coordinator.decrementReadyApps();
+						SL.endVM(vmToRemove);
+						consecutiveLowUtil = 0;
+					}
+				} else {
+					consecutiveLowUtil = 0;
+				}
+			} else {
+				consecutiveLowUtil = 0;
 			}
 		}
 	}
 
 	private static CoordinatorInterface lookupCoordinator(Registry registry) throws Exception {
-        while (true) {
-            try {
-                return (CoordinatorInterface) registry.lookup("Coordinator");
-            } catch (Exception e) {
-                Thread.sleep(50);
-            }
-        }
-    }
+		while (true) {
+			try {
+				return (CoordinatorInterface) registry.lookup("Coordinator");
+			} catch (Exception e) {
+				Thread.sleep(50);
+			}
+		}
+	}
 }
-
