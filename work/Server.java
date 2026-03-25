@@ -84,6 +84,10 @@ public class Server {
 		int consecutiveLowUtil = 0;
 		boolean addedExtraFE = false;
 
+		while (coordinator.getReadyAppCount() < 1) {
+			Thread.sleep(200);
+		}
+
 		while (true) {
 			Thread.sleep(500);
 
