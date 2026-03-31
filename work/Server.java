@@ -6,168 +6,399 @@ import java.util.List;
 
 public class Server {
 
-    public static void main(String args[]) throws Exception {
-        if (args.length != 3) throw new Exception("Need 3 args: <cloud_ip> <cloud_port> <VM id>");
+	private static final int TICK_MS = 500;
+	private static final double RATE_SMOOTH_ALPHA = 0.35;
+	/** FE A/B: was 2500; faster FE scale-up vs APP 1500ms (test FE-lag on heavy trace). */
+	private static final long FE_SCALE_UP_COOLDOWN_MS = 1800;
+	private static final long FE_SCALE_DOWN_COOLDOWN_MS = 4500;
+	private static final long APP_SCALE_UP_COOLDOWN_MS = 1500;
+	private static final long APP_SCALE_DOWN_COOLDOWN_MS = 5000;
 
-        String cloudIp = args[0];
-        int cloudPort = Integer.parseInt(args[1]);
-        ServerLib SL = new ServerLib(cloudIp, cloudPort);
-        int myVMid = Integer.parseInt(args[2]);
+	/** FE A/B: was 4; +1 extra FE (baseline ~median 164 timeouts @ ~901k VM on c-150-123). */
+	private static final int MAX_EXTRA_FE = 5;
+	private static final int APP_QUEUE_SCALE_UP = 3;
+	private static final long APP_OLDEST_AGE_SCALE_UP_MS = 900;
+	/** Scale FE when aggregate reported FE queue reaches this (absolute; no APP comparison gate). */
+	private static final int FE_TOTAL_QUEUE_SCALE_UP = 4;
 
-        Registry registry = LocateRegistry.getRegistry(cloudIp, cloudPort);
+	private static final int CONSECUTIVE_FE_LOW_FOR_SCALE_DOWN = 10;
+	private static final int CONSECUTIVE_APP_LOW_FOR_SCALE_DOWN = 9;
 
-        if (myVMid == 1) {
-            Coordinator coordinator = new Coordinator();
-            coordinator.setServerLib(SL);
-            registry.rebind("Coordinator", coordinator);
-            SL.register_frontend();
+	/**
+	 * Expected APP throughput for scale-up target and starvation check
+	 * (ceil(smoothedRate / this); starve when rate exceeds runningApps * this).
+	 */
+	private static final double APP_REQ_PER_SEC_SCALE_UP_TARGET = 2.8;
 
-            List<Integer> appVMs = Collections.synchronizedList(new ArrayList<>());
-            List<Integer> feVMs = Collections.synchronizedList(new ArrayList<>());
+	/**
+	 * Assumed service capacity per running APP for scale-down hysteresis only.
+	 * Kept separate from {@link #APP_REQ_PER_SEC_SCALE_UP_TARGET}; do not lower casually
+	 * or scale-down becomes more aggressive.
+	 */
+	private static final double APP_PROC_CAPACITY_FOR_SCALE_DOWN = 3.0;
 
-            for (int i = 0; i < 2; i++) {
-                int id = SL.startVM();
-                coordinator.assignRole(id, "APP");
-                appVMs.add(id);
-            }
+	private static final long FE_REPORT_INTERVAL_MS = 400;
 
-            Thread scaler = new Thread(() -> {
-                try {
-                    scaleLoop(SL, coordinator, appVMs, feVMs);
-                } catch (Exception e) {
-                }
-            });
-            scaler.setDaemon(true);
-            scaler.start();
+	/** Set false for one A/B run to test whether scale-down causes timeout cascades. */
+	private static final boolean ENABLE_SCALE_DOWN = true;
 
-            while (true) {
-                ServerLib.Handle h = SL.acceptConnection();
-                Cloud.FrontEndOps.Request r = SL.parseRequest(h);
-                coordinator.submitRequest(r);
-            }
-        } else {
-            CoordinatorInterface coordinator = lookupCoordinator(registry);
-            String role = coordinator.getRole(myVMid);
+	/** Recitation 10: fine for local runs; set false before submission if perf matters. */
+	private static final boolean SCALER_DEBUG_LOG = false;
 
-            if ("FRONTEND".equals(role)) {
-                SL.register_frontend();
-                while (true) {
-                    ServerLib.Handle h = SL.acceptConnection();
-                    Cloud.FrontEndOps.Request r = SL.parseRequest(h);
-                    coordinator.submitRequest(r);
-                }
-            } else if ("APP".equals(role)) {
-                try {
-                    while (true) {
-                        if (coordinator.shouldShutdown(myVMid)) {
-                            break;
-                        }
-                        Cloud.FrontEndOps.Request r = coordinator.getNextRequest();
-                        if (r != null) {
-                            SL.processRequest(r);
-                        }
-                    }
-                } catch (java.rmi.RemoteException e) {
-                }
-                SL.shutDown();
-            }
-        }
-    }
+	public static void main(String args[]) throws Exception {
+		if (args.length != 3) {
+			throw new Exception("Need 3 args: <cloud_ip> <cloud_port> <VM id>");
+		}
 
-    private static void scaleLoop(ServerLib SL, Coordinator coordinator,
-            List<Integer> appVMs, List<Integer> feVMs) throws Exception {
-        int minApps = 1;
-        int maxApps = 6;
-        long lastScaleUp = 0;
-        long lastFeScaleUp = 0;
-        int prevSubmitted = 0;
-        int consecutiveLowUtil = 0;
-        boolean addedExtraFE = false;
+		String cloudIp = args[0];
+		int cloudPort = Integer.parseInt(args[1]);
+		ServerLib SL = new ServerLib(cloudIp, cloudPort);
+		int myVMid = Integer.parseInt(args[2]);
 
-        while (coordinator.getReadyAppCount() < 1) {
-            Thread.sleep(200);
-        }
+		Registry registry = LocateRegistry.getRegistry(cloudIp, cloudPort);
 
-        while (true) {
-            Thread.sleep(500);
+		if (myVMid == 1) {
+			Coordinator coordinator = new Coordinator();
+			coordinator.setServerLib(SL);
+			registry.rebind("Coordinator", coordinator);
+			SL.register_frontend();
 
-            int appQueueSize = coordinator.getLocalQueueSize();
-            int feQueueLength = SL.getQueueLength();
-            int readyApps = coordinator.getReadyAppCount();
-            long now = System.currentTimeMillis();
+			List<Integer> appVMs = Collections.synchronizedList(new ArrayList<>());
+			List<Integer> feVMs = Collections.synchronizedList(new ArrayList<>());
 
-            int nowSubmitted = coordinator.getTotalSubmitted();
-            int delta = nowSubmitted - prevSubmitted;
-            prevSubmitted = nowSubmitted;
-            double ratePerSecond = delta * 2.0;
+			for (int i = 0; i < 2; i++) {
+				int id = SL.startVM();
+				coordinator.assignRole(id, "APP");
+				appVMs.add(id);
+			}
 
-            int totalPending = appQueueSize + feQueueLength;
+			Thread scaler = new Thread(() -> {
+				try {
+					scaleLoop(SL, coordinator, appVMs, feVMs);
+				} catch (Exception e) {
+				}
+			});
+			scaler.setDaemon(true);
+			scaler.start();
 
-            if (!addedExtraFE && feQueueLength > 2 && (now - lastFeScaleUp > 2000)) {
-                int feId = SL.startVM();
-                coordinator.assignRole(feId, "FRONTEND");
-                feVMs.add(feId);
-                addedExtraFE = true;
-                lastFeScaleUp = now;
-            }
+			while (true) {
+				ServerLib.Handle h = SL.acceptConnection();
+				Cloud.FrontEndOps.Request r = SL.parseRequest(h);
+				coordinator.submitRequest(r);
+			}
+		} else {
+			CoordinatorInterface coordinator = lookupCoordinator(registry);
+			String role = coordinator.getRole(myVMid);
 
-            if (totalPending > 2 && appVMs.size() < maxApps && (now - lastScaleUp > 500)) {
-                int targetApps = appVMs.size() + 1;
-                if (ratePerSecond > 0) {
-                    targetApps = Math.max(targetApps, (int)(ratePerSecond / 3.0) + 1);
-                }
-                targetApps = Math.min(targetApps, maxApps);
+			if ("FRONTEND".equals(role)) {
+				runFrontendWorker(SL, coordinator, myVMid);
+			} else if ("APP".equals(role)) {
+				runAppWorker(SL, coordinator, myVMid);
+			} else {
+				SL.shutDown();
+			}
+		}
+	}
 
-                int appsToAdd = Math.max(1, targetApps - appVMs.size());
-                appsToAdd = Math.min(appsToAdd, 3);
+	/**
+	 * Extra frontend: register, report queue periodically, accept/parse/submit until
+	 * shutdown; then unregisterFrontend and drain acceptConnection until null (handout).
+	 */
+	private static void runFrontendWorker(ServerLib SL, CoordinatorInterface coord, int myVMid) {
+		SL.register_frontend();
+		try {
+			coord.registerFeReady(myVMid);
+		} catch (java.rmi.RemoteException e) {
+			SL.shutDown();
+			return;
+		}
 
-                for (int i = 0; i < appsToAdd; i++) {
-                    int newId = SL.startVM();
-                    coordinator.assignRole(newId, "APP");
-                    appVMs.add(newId);
-                }
-                lastScaleUp = now;
-                consecutiveLowUtil = 0;
-            } else if (nowSubmitted > 0 && appQueueSize == 0 && feQueueLength == 0
-                    && appVMs.size() > minApps && readyApps > minApps) {
-                double capacity = readyApps * 3.0;
-                if (capacity > 0 && ratePerSecond < capacity * 0.5) {
-                    consecutiveLowUtil++;
-                    if (consecutiveLowUtil > 4) {
-                        int numToRemove = Math.min(2, appVMs.size() - minApps);
-                        for (int i = 0; i < numToRemove; i++) {
-                            int vmToRemove = appVMs.remove(appVMs.size() - 1);
-                            coordinator.markForShutdown(vmToRemove);
-                            coordinator.decrementReadyApps();
-                            SL.endVM(vmToRemove);
-                        }
-                        consecutiveLowUtil = 0;
-                    }
-                } else if (capacity > 0 && ratePerSecond < capacity * 0.7) {
-                    consecutiveLowUtil++;
-                    if (consecutiveLowUtil > 8) {
-                        int vmToRemove = appVMs.remove(appVMs.size() - 1);
-                        coordinator.markForShutdown(vmToRemove);
-                        coordinator.decrementReadyApps();
-                        SL.endVM(vmToRemove);
-                        consecutiveLowUtil = 0;
-                    }
-                } else {
-                    consecutiveLowUtil = 0;
-                }
-            } else {
-                consecutiveLowUtil = 0;
-            }
-        }
-    }
+		Thread reporter = new Thread(() -> {
+			try {
+				while (!Thread.interrupted()) {
+					Thread.sleep(FE_REPORT_INTERVAL_MS);
+					try {
+						coord.reportFeQueue(myVMid, SL.getQueueLength());
+					} catch (java.rmi.RemoteException e) {
+						break;
+					}
+				}
+			} catch (InterruptedException e) {
+			}
+		});
+		reporter.setDaemon(true);
+		reporter.start();
 
-    private static CoordinatorInterface lookupCoordinator(Registry registry) throws Exception {
-        while (true) {
-            try {
-                return (CoordinatorInterface) registry.lookup("Coordinator");
-            } catch (Exception e) {
-                Thread.sleep(50);
-            }
-        }
-    }
+		try {
+			while (true) {
+				boolean shutdown = false;
+				try {
+					shutdown = coord.shouldShutdown(myVMid);
+				} catch (java.rmi.RemoteException e) {
+					break;
+				}
+
+				if (shutdown) {
+					SL.unregisterFrontend();
+					reporter.interrupt();
+					try {
+						reporter.join(2000);
+					} catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+					}
+					ServerLib.Handle h;
+					while ((h = SL.acceptConnection()) != null) {
+						Cloud.FrontEndOps.Request r = SL.parseRequest(h);
+						try {
+							coord.submitRequest(r);
+						} catch (java.rmi.RemoteException e) {
+							break;
+						}
+					}
+					break;
+				}
+
+				ServerLib.Handle h = SL.acceptConnection();
+				Cloud.FrontEndOps.Request r = SL.parseRequest(h);
+				try {
+					coord.submitRequest(r);
+				} catch (java.rmi.RemoteException e) {
+					break;
+				}
+			}
+		} finally {
+			reporter.interrupt();
+			try {
+				coord.registerFeStopped(myVMid);
+			} catch (java.rmi.RemoteException e) {
+			}
+			SL.shutDown();
+		}
+	}
+
+	/**
+	 * APP: announce ready, then process requests; when idle and shutdown flagged, exit.
+	 * registerAppStopped keeps coordinator counts consistent with graceful scale-down.
+	 */
+	private static void runAppWorker(ServerLib SL, CoordinatorInterface coord, int myVMid) {
+		try {
+			coord.registerAppReady(myVMid);
+		} catch (java.rmi.RemoteException e) {
+			SL.shutDown();
+			return;
+		}
+		try {
+			while (true) {
+				Cloud.FrontEndOps.Request r = coord.getNextRequest();
+				if (r != null) {
+					SL.processRequest(r);
+					continue;
+				}
+				if (coord.shouldShutdown(myVMid)) {
+					break;
+				}
+			}
+		} catch (java.rmi.RemoteException e) {
+		} finally {
+			try {
+				coord.registerAppStopped(myVMid);
+			} catch (java.rmi.RemoteException e) {
+			}
+			SL.shutDown();
+		}
+	}
+
+	private static void scaleLoop(ServerLib SL, Coordinator coordinator,
+			List<Integer> appVMs, List<Integer> feVMs) throws Exception {
+		final int minApps = 1;
+		final int maxApps = 10;
+		long lastAppScaleUp = 0;
+		long lastAppScaleDown = 0;
+		long lastFeScaleUp = 0;
+		long lastFeScaleDown = 0;
+		int prevSubmitted = 0;
+		double smoothedRate = 0;
+		boolean rateInitialized = false;
+		int consecutiveFeLow = 0;
+		int consecutiveAppLowRaw = 0;
+		int consecutiveAppLowStricter = 0;
+
+		while (coordinator.getRunningAppCount() < 1) {
+			Thread.sleep(200);
+		}
+
+		while (true) {
+			coordinator.reportFeQueue(1, SL.getQueueLength());
+			Thread.sleep(TICK_MS);
+
+			long now = System.currentTimeMillis();
+			int appQueueSize = coordinator.getLocalQueueSize();
+			long oldestAgeMs = coordinator.getOldestRequestAgeMs();
+			int totalFeQueue = coordinator.getTotalFeReportedQueue();
+			int runningApps = coordinator.getRunningAppCount();
+			int bootingApps = coordinator.getBootingAppCount();
+			int committedApps = runningApps + bootingApps;
+			int runningExtraFe = coordinator.getRunningFeCount();
+			int bootingFe = coordinator.getBootingFeCount();
+			int committedExtraFe = runningExtraFe + bootingFe;
+
+			int nowSubmitted = coordinator.getTotalSubmitted();
+			int delta = nowSubmitted - prevSubmitted;
+			prevSubmitted = nowSubmitted;
+			double instantRatePerSec = delta * (1000.0 / TICK_MS);
+			if (!rateInitialized) {
+				smoothedRate = instantRatePerSec;
+				rateInitialized = true;
+			} else {
+				smoothedRate = (1.0 - RATE_SMOOTH_ALPHA) * smoothedRate
+						+ RATE_SMOOTH_ALPHA * instantRatePerSec;
+			}
+
+			boolean feIsBottleneck = totalFeQueue >= FE_TOTAL_QUEUE_SCALE_UP;
+			boolean appNeedsCapacity = appQueueSize >= APP_QUEUE_SCALE_UP
+					|| oldestAgeMs >= APP_OLDEST_AGE_SCALE_UP_MS;
+			boolean appStarvedByRate = runningApps > 0 && appQueueSize > 0
+					&& smoothedRate > runningApps * APP_REQ_PER_SEC_SCALE_UP_TARGET;
+			boolean needMoreApp = (appNeedsCapacity || appStarvedByRate)
+					&& committedApps < maxApps
+					&& (now - lastAppScaleUp > APP_SCALE_UP_COOLDOWN_MS);
+
+			boolean didScaleUp = false;
+
+			if (needMoreApp) {
+				int targetApps = Math.min(maxApps,
+						Math.max(committedApps + 1,
+								(int) Math.ceil(smoothedRate / APP_REQ_PER_SEC_SCALE_UP_TARGET)));
+				int want = targetApps - committedApps;
+				want = Math.max(1, Math.min(2, want));
+				want = Math.min(want, maxApps - committedApps);
+				for (int i = 0; i < want; i++) {
+					int newId = SL.startVM();
+					coordinator.assignRole(newId, "APP");
+					synchronized (appVMs) {
+						appVMs.add(newId);
+					}
+				}
+				lastAppScaleUp = now;
+				consecutiveFeLow = 0;
+				consecutiveAppLowRaw = 0;
+				consecutiveAppLowStricter = 0;
+				didScaleUp = true;
+			}
+
+			if (feIsBottleneck && committedExtraFe < MAX_EXTRA_FE
+					&& (now - lastFeScaleUp > FE_SCALE_UP_COOLDOWN_MS)) {
+				int feId = SL.startVM();
+				coordinator.assignRole(feId, "FRONTEND");
+				synchronized (feVMs) {
+					feVMs.add(feId);
+				}
+				lastFeScaleUp = now;
+				consecutiveFeLow = 0;
+				didScaleUp = true;
+			}
+
+			if (!didScaleUp && ENABLE_SCALE_DOWN) {
+				boolean appQuiet = appQueueSize == 0 && oldestAgeMs < 150;
+				boolean feQuiet = totalFeQueue <= 1;
+				double procCapacity = runningApps * APP_PROC_CAPACITY_FOR_SCALE_DOWN;
+
+				if (appQuiet && feQuiet && nowSubmitted > 0 && procCapacity > 0) {
+					if (smoothedRate < procCapacity * 0.5) {
+						consecutiveAppLowRaw++;
+					} else {
+						consecutiveAppLowRaw = 0;
+					}
+					if (smoothedRate < procCapacity * 0.38) {
+						consecutiveAppLowStricter++;
+					} else {
+						consecutiveAppLowStricter = 0;
+					}
+					if (totalFeQueue <= 1) {
+						consecutiveFeLow++;
+					} else {
+						consecutiveFeLow = 0;
+					}
+				} else {
+					consecutiveAppLowRaw = 0;
+					consecutiveAppLowStricter = 0;
+					consecutiveFeLow = 0;
+				}
+
+				boolean canScaleDownApp = runningApps > minApps && bootingApps == 0
+						&& appQuiet && feQuiet
+						&& (now - lastAppScaleDown > APP_SCALE_DOWN_COOLDOWN_MS);
+				if (canScaleDownApp) {
+					if (consecutiveAppLowStricter >= CONSECUTIVE_APP_LOW_FOR_SCALE_DOWN) {
+						synchronized (appVMs) {
+							if (appVMs.size() > minApps) {
+								int vmToRemove = appVMs.remove(appVMs.size() - 1);
+								coordinator.markForShutdown(vmToRemove);
+								lastAppScaleDown = now;
+								consecutiveAppLowRaw = 0;
+								consecutiveAppLowStricter = 0;
+								if (SCALER_DEBUG_LOG) {
+									System.err.println("scaler: APP scale-down 1 vm=" + vmToRemove);
+								}
+							}
+						}
+					} else if (consecutiveAppLowRaw >= CONSECUTIVE_APP_LOW_FOR_SCALE_DOWN + 4) {
+						synchronized (appVMs) {
+							if (appVMs.size() > minApps + 1) {
+								int n = Math.min(2, appVMs.size() - minApps);
+								for (int k = 0; k < n; k++) {
+									int vmToRemove = appVMs.remove(appVMs.size() - 1);
+									coordinator.markForShutdown(vmToRemove);
+								}
+								lastAppScaleDown = now;
+								consecutiveAppLowRaw = 0;
+								consecutiveAppLowStricter = 0;
+								if (SCALER_DEBUG_LOG) {
+									System.err.println("scaler: APP scale-down n=" + n);
+								}
+							}
+						}
+					}
+				}
+
+				boolean canScaleDownFe = appQuiet && totalFeQueue <= 1 && !feVMs.isEmpty()
+						&& (now - lastFeScaleDown > FE_SCALE_DOWN_COOLDOWN_MS)
+						&& consecutiveFeLow >= CONSECUTIVE_FE_LOW_FOR_SCALE_DOWN;
+				if (canScaleDownFe) {
+					synchronized (feVMs) {
+						if (!feVMs.isEmpty()) {
+							int feRemove = feVMs.remove(feVMs.size() - 1);
+							coordinator.markForShutdown(feRemove);
+							lastFeScaleDown = now;
+							consecutiveFeLow = 0;
+							if (SCALER_DEBUG_LOG) {
+								System.err.println("scaler: FE scale-down vm=" + feRemove);
+							}
+						}
+					}
+				}
+			} else if (!didScaleUp) {
+				consecutiveAppLowRaw = 0;
+				consecutiveAppLowStricter = 0;
+				consecutiveFeLow = 0;
+			}
+
+			if (SCALER_DEBUG_LOG) {
+				System.err.printf(
+						"scaler appQ=%d oldest=%d feQ=%d rate=%.1f rApp=%d bApp=%d rFe=%d bFe=%d up=%b%n",
+						appQueueSize, oldestAgeMs, totalFeQueue, smoothedRate,
+						runningApps, bootingApps, runningExtraFe, bootingFe, didScaleUp);
+			}
+		}
+	}
+
+	private static CoordinatorInterface lookupCoordinator(Registry registry) throws Exception {
+		while (true) {
+			try {
+				return (CoordinatorInterface) registry.lookup("Coordinator");
+			} catch (Exception e) {
+				Thread.sleep(50);
+			}
+		}
+	}
 }
