@@ -26,7 +26,7 @@ public class Server {
 
 	/**
 	 * Expected APP throughput for scale-up target and starvation check
-	 * (ceil(smoothedRate / this); starve when rate exceeds runningApps * this).
+	 * (ceil(smoothedRate / this); starve when rate exceeds committedApps * this).
 	 */
 	private static final double APP_REQ_PER_SEC_SCALE_UP_TARGET = 2.8;
 
@@ -38,6 +38,14 @@ public class Server {
 	private static final double APP_PROC_CAPACITY_FOR_SCALE_DOWN = 3.0;
 
 	private static final long FE_REPORT_INTERVAL_MS = 400;
+
+	/** From scaler start: short-window burst scale-up for cold-start / Black Friday-style spikes. */
+	private static final long BURST_BOOTSTRAP_MS = 4000;
+	private static final long BURST_FE_SCALE_UP_COOLDOWN_MS = 1000;
+	private static final long BURST_APP_SCALE_UP_COOLDOWN_MS = 900;
+	private static final int BURST_APP_BATCH_CAP = 2;
+	/** Extra FE ceiling during burst (vs {@link #MAX_EXTRA_FE} steady-state). */
+	private static final int BURST_MAX_EXTRA_FE_CAP = 5;
 
 	/** Set false for one A/B run to test whether scale-down causes timeout cascades. */
 	private static final boolean ENABLE_SCALE_DOWN = true;
@@ -66,7 +74,7 @@ public class Server {
 			List<Integer> appVMs = Collections.synchronizedList(new ArrayList<>());
 			List<Integer> feVMs = Collections.synchronizedList(new ArrayList<>());
 
-			for (int i = 0; i < 2; i++) {
+			for (int i = 0; i < 3; i++) {
 				int id = SL.startVM();
 				coordinator.assignRole(id, "APP");
 				appVMs.add(id);
@@ -223,15 +231,19 @@ public class Server {
 		int consecutiveAppLowRaw = 0;
 		int consecutiveAppLowStricter = 0;
 
-		while (coordinator.getRunningAppCount() < 1) {
-			Thread.sleep(200);
-		}
+		final long scaleLoopStart = System.currentTimeMillis();
 
 		while (true) {
 			coordinator.reportFeQueue(1, SL.getQueueLength());
 			Thread.sleep(TICK_MS);
 
 			long now = System.currentTimeMillis();
+			boolean inBurstBootstrap = (now - scaleLoopStart) < BURST_BOOTSTRAP_MS;
+			long appUpCooldown = inBurstBootstrap ? BURST_APP_SCALE_UP_COOLDOWN_MS : APP_SCALE_UP_COOLDOWN_MS;
+			long feUpCooldown = inBurstBootstrap ? BURST_FE_SCALE_UP_COOLDOWN_MS : FE_SCALE_UP_COOLDOWN_MS;
+			int extraFeCap = inBurstBootstrap ? Math.max(MAX_EXTRA_FE, BURST_MAX_EXTRA_FE_CAP) : MAX_EXTRA_FE;
+			int appBatchCap = inBurstBootstrap ? BURST_APP_BATCH_CAP : 2;
+
 			int appQueueSize = coordinator.getLocalQueueSize();
 			long oldestAgeMs = coordinator.getOldestRequestAgeMs();
 			int totalFeQueue = coordinator.getTotalFeReportedQueue();
@@ -255,13 +267,14 @@ public class Server {
 			}
 
 			boolean feIsBottleneck = totalFeQueue >= FE_TOTAL_QUEUE_SCALE_UP;
-			boolean appNeedsCapacity = appQueueSize >= APP_QUEUE_SCALE_UP
-					|| oldestAgeMs >= APP_OLDEST_AGE_SCALE_UP_MS;
-			boolean appStarvedByRate = runningApps > 0 && appQueueSize > 0
-					&& smoothedRate > runningApps * APP_REQ_PER_SEC_SCALE_UP_TARGET;
+			boolean appsReady = runningApps > 0;
+			boolean appNeedsCapacity = appsReady && (appQueueSize >= APP_QUEUE_SCALE_UP
+					|| oldestAgeMs >= APP_OLDEST_AGE_SCALE_UP_MS);
+			boolean appStarvedByRate = committedApps > 0 && appQueueSize > 0
+					&& smoothedRate > committedApps * APP_REQ_PER_SEC_SCALE_UP_TARGET;
 			boolean needMoreApp = (appNeedsCapacity || appStarvedByRate)
 					&& committedApps < maxApps
-					&& (now - lastAppScaleUp > APP_SCALE_UP_COOLDOWN_MS);
+					&& (now - lastAppScaleUp > appUpCooldown);
 
 			boolean didScaleUp = false;
 
@@ -270,7 +283,7 @@ public class Server {
 						Math.max(committedApps + 1,
 								(int) Math.ceil(smoothedRate / APP_REQ_PER_SEC_SCALE_UP_TARGET)));
 				int want = targetApps - committedApps;
-				want = Math.max(1, Math.min(2, want));
+				want = Math.max(1, Math.min(appBatchCap, want));
 				want = Math.min(want, maxApps - committedApps);
 				for (int i = 0; i < want; i++) {
 					int newId = SL.startVM();
@@ -286,8 +299,8 @@ public class Server {
 				didScaleUp = true;
 			}
 
-			if (feIsBottleneck && committedExtraFe < MAX_EXTRA_FE
-					&& (now - lastFeScaleUp > FE_SCALE_UP_COOLDOWN_MS)) {
+			if (feIsBottleneck && committedExtraFe < extraFeCap
+					&& (now - lastFeScaleUp > feUpCooldown)) {
 				int feId = SL.startVM();
 				coordinator.assignRole(feId, "FRONTEND");
 				synchronized (feVMs) {
