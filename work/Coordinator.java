@@ -1,3 +1,7 @@
+/*
+ * Coordinator: single APP request queue, RMI role assignment, booting vs running counts
+ * for scaled APPs and extra FEs, aggregated FE queue reports, and per-VM shutdown flags.
+ */
 import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.Set;
@@ -6,14 +10,14 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Coordinator: central APP queue, per-role assignment, explicit VM lifecycle
- * (booting vs running for APP and extra FE), FE queue aggregation, shutdown flags.
- */
 public class Coordinator extends UnicastRemoteObject implements CoordinatorInterface {
 
 	private static final long MAX_REQUEST_AGE_MS = 3000;
 	private static final long FE_REPORT_STALE_MS = 5000;
+	private static final long REQUEST_POLL_MS = 50;
+
+	private static final String ROLE_APP = "APP";
+	private static final String ROLE_FRONTEND = "FRONTEND";
 
 	private static class TimestampedRequest {
 		final Cloud.FrontEndOps.Request request;
@@ -38,11 +42,11 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
 	private final AtomicInteger totalSubmitted;
 	private final Set<Integer> shutdownSet;
 
-	/** APP: assigned via assignRole("APP") until registerAppReady. */
+	// APP VMs between assignRole(APP) and registerAppReady.
 	private final Set<Integer> bootingAppIds;
 	private final Set<Integer> runningAppVmIds;
 
-	/** Extra FE only (VM 1 is not tracked here). */
+	// Extra FEs only (primary FE on VM 1 is not tracked here).
 	private final Set<Integer> bootingFeIds;
 	private final Set<Integer> runningFeVmIds;
 
@@ -66,15 +70,12 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
 		this.sl = sl;
 	}
 
-	/**
-	 * Called on VM 1 when scaler (or bootstrap) creates a worker. Updates roles
-	 * and marks APP or FRONTEND as booting until register*Ready from that VM.
-	 */
+	// Record role and mark APP or extra FE as booting until register*Ready.
 	public void assignRole(int vmId, String role) {
 		roles.put(vmId, role);
-		if ("APP".equals(role)) {
+		if (ROLE_APP.equals(role)) {
 			bootingAppIds.add(vmId);
-		} else if ("FRONTEND".equals(role)) {
+		} else if (ROLE_FRONTEND.equals(role)) {
 			bootingFeIds.add(vmId);
 		}
 	}
@@ -94,7 +95,7 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
 	public Cloud.FrontEndOps.Request getNextRequest() throws RemoteException {
 		try {
 			while (true) {
-				TimestampedRequest tr = reqQueue.poll(50, TimeUnit.MILLISECONDS);
+				TimestampedRequest tr = reqQueue.poll(REQUEST_POLL_MS, TimeUnit.MILLISECONDS);
 				if (tr == null) {
 					return null;
 				}
@@ -200,6 +201,7 @@ public class Coordinator extends UnicastRemoteObject implements CoordinatorInter
 		return totalSubmitted.get();
 	}
 
+	// Same as queue size; used by scaler on coordinator host without RMI.
 	public int getLocalQueueSize() {
 		return reqQueue.size();
 	}

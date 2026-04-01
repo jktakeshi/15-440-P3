@@ -1,3 +1,7 @@
+/*
+ * RMI API between Server (VM 1 and workers) and Coordinator: roles, request path,
+ * lifecycle, scaler queries (queue depth, FE reports, shutdown).
+ */
 import java.rmi.Remote;
 import java.rmi.RemoteException;
 

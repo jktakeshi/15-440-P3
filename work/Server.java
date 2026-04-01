@@ -1,3 +1,8 @@
+/*
+ * P3 Cloud server: VM 1 runs the Coordinator and primary FE, starts APP VMs, and runs a
+ * background scaler (APP/FE scale-up/down from queues, request age, and smoothed rate).
+ * Other VMs act as extra FEs or APP workers per coordinator role.
+ */
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.util.ArrayList;
@@ -6,55 +11,60 @@ import java.util.List;
 
 public class Server {
 
+	private static final int EXPECTED_ARG_COUNT = 3;
+	private static final int COORDINATOR_HOST_VM_ID = 1;
+	private static final String ROLE_FRONTEND = "FRONTEND";
+	private static final String ROLE_APP = "APP";
+	private static final String COORDINATOR_REGISTRY_NAME = "Coordinator";
+
+	private static final int INITIAL_APP_VM_COUNT = 3;
+	private static final int MIN_APPS = 1;
+	private static final int MAX_APPS = 10;
+
 	private static final int TICK_MS = 500;
+	private static final int MS_PER_SECOND = 1000;
 	private static final double RATE_SMOOTH_ALPHA = 0.35;
-	/** FE A/B: was 2500; faster FE scale-up vs APP 1500ms (test FE-lag on heavy trace). */
+
 	private static final long FE_SCALE_UP_COOLDOWN_MS = 1800;
 	private static final long FE_SCALE_DOWN_COOLDOWN_MS = 4500;
 	private static final long APP_SCALE_UP_COOLDOWN_MS = 1500;
 	private static final long APP_SCALE_DOWN_COOLDOWN_MS = 5000;
 
-	/** FE A/B: was 4; +1 extra FE (baseline ~median 164 timeouts @ ~901k VM on c-150-123). */
 	private static final int MAX_EXTRA_FE = 5;
 	private static final int APP_QUEUE_SCALE_UP = 3;
 	private static final long APP_OLDEST_AGE_SCALE_UP_MS = 900;
-	/** Scale FE when aggregate reported FE queue reaches this (absolute; no APP comparison gate). */
 	private static final int FE_TOTAL_QUEUE_SCALE_UP = 4;
 
 	private static final int CONSECUTIVE_FE_LOW_FOR_SCALE_DOWN = 10;
 	private static final int CONSECUTIVE_APP_LOW_FOR_SCALE_DOWN = 9;
+	private static final int CONSECUTIVE_LOW_EXTRA_FOR_BATCH_APP_DOWN = 4;
+	private static final int APP_SCALE_DOWN_BATCH_MAX = 2;
 
-	/**
-	 * Expected APP throughput for scale-up target and starvation check
-	 * (ceil(smoothedRate / this); starve when rate exceeds committedApps * this).
-	 */
 	private static final double APP_REQ_PER_SEC_SCALE_UP_TARGET = 2.8;
-
-	/**
-	 * Assumed service capacity per running APP for scale-down hysteresis only.
-	 * Kept separate from {@link #APP_REQ_PER_SEC_SCALE_UP_TARGET}; do not lower casually
-	 * or scale-down becomes more aggressive.
-	 */
 	private static final double APP_PROC_CAPACITY_FOR_SCALE_DOWN = 3.0;
 
 	private static final long FE_REPORT_INTERVAL_MS = 400;
+	private static final long FE_REPORTER_JOIN_TIMEOUT_MS = 2000;
 
-	/** From scaler start: short-window burst scale-up for cold-start / Black Friday-style spikes. */
 	private static final long BURST_BOOTSTRAP_MS = 4000;
 	private static final long BURST_FE_SCALE_UP_COOLDOWN_MS = 1000;
 	private static final long BURST_APP_SCALE_UP_COOLDOWN_MS = 900;
 	private static final int BURST_APP_BATCH_CAP = 2;
-	/** Extra FE ceiling during burst (vs {@link #MAX_EXTRA_FE} steady-state). */
 	private static final int BURST_MAX_EXTRA_FE_CAP = 5;
+	private static final int STEADY_STATE_APP_BATCH_CAP = 2;
 
-	/** Set false for one A/B run to test whether scale-down causes timeout cascades. */
+	private static final long SCALE_DOWN_MAX_OLDEST_AGE_MS = 150;
+	private static final int SCALE_DOWN_FE_QUEUE_MAX = 1;
+	private static final double SCALE_DOWN_RATE_FRAC_FOR_RAW_COUNT = 0.5;
+	private static final double SCALE_DOWN_RATE_FRAC_FOR_STRICT_COUNT = 0.38;
+
+	private static final long REGISTRY_LOOKUP_RETRY_MS = 50;
+
 	private static final boolean ENABLE_SCALE_DOWN = true;
 
-	/** Recitation 10: fine for local runs; set false before submission if perf matters. */
-	private static final boolean SCALER_DEBUG_LOG = false;
-
+	// Coordinator host: accept client connections; workers run FE or APP loop.
 	public static void main(String args[]) throws Exception {
-		if (args.length != 3) {
+		if (args.length != EXPECTED_ARG_COUNT) {
 			throw new Exception("Need 3 args: <cloud_ip> <cloud_port> <VM id>");
 		}
 
@@ -65,18 +75,18 @@ public class Server {
 
 		Registry registry = LocateRegistry.getRegistry(cloudIp, cloudPort);
 
-		if (myVMid == 1) {
+		if (myVMid == COORDINATOR_HOST_VM_ID) {
 			Coordinator coordinator = new Coordinator();
 			coordinator.setServerLib(SL);
-			registry.rebind("Coordinator", coordinator);
+			registry.rebind(COORDINATOR_REGISTRY_NAME, coordinator);
 			SL.register_frontend();
 
 			List<Integer> appVMs = Collections.synchronizedList(new ArrayList<>());
 			List<Integer> feVMs = Collections.synchronizedList(new ArrayList<>());
 
-			for (int i = 0; i < 3; i++) {
+			for (int i = 0; i < INITIAL_APP_VM_COUNT; i++) {
 				int id = SL.startVM();
-				coordinator.assignRole(id, "APP");
+				coordinator.assignRole(id, ROLE_APP);
 				appVMs.add(id);
 			}
 
@@ -84,6 +94,7 @@ public class Server {
 				try {
 					scaleLoop(SL, coordinator, appVMs, feVMs);
 				} catch (Exception e) {
+					// Scaler dies with coordinator; ignore.
 				}
 			});
 			scaler.setDaemon(true);
@@ -98,9 +109,9 @@ public class Server {
 			CoordinatorInterface coordinator = lookupCoordinator(registry);
 			String role = coordinator.getRole(myVMid);
 
-			if ("FRONTEND".equals(role)) {
+			if (ROLE_FRONTEND.equals(role)) {
 				runFrontendWorker(SL, coordinator, myVMid);
-			} else if ("APP".equals(role)) {
+			} else if (ROLE_APP.equals(role)) {
 				runAppWorker(SL, coordinator, myVMid);
 			} else {
 				SL.shutDown();
@@ -108,10 +119,7 @@ public class Server {
 		}
 	}
 
-	/**
-	 * Extra frontend: register, report queue periodically, accept/parse/submit until
-	 * shutdown; then unregisterFrontend and drain acceptConnection until null (handout).
-	 */
+	// Extra FE: register, report queue, serve until shutdown; then drain connections.
 	private static void runFrontendWorker(ServerLib SL, CoordinatorInterface coord, int myVMid) {
 		SL.register_frontend();
 		try {
@@ -132,6 +140,7 @@ public class Server {
 					}
 				}
 			} catch (InterruptedException e) {
+				// Shutdown via interrupt.
 			}
 		});
 		reporter.setDaemon(true);
@@ -150,7 +159,7 @@ public class Server {
 					SL.unregisterFrontend();
 					reporter.interrupt();
 					try {
-						reporter.join(2000);
+						reporter.join(FE_REPORTER_JOIN_TIMEOUT_MS);
 					} catch (InterruptedException e) {
 						Thread.currentThread().interrupt();
 					}
@@ -179,15 +188,13 @@ public class Server {
 			try {
 				coord.registerFeStopped(myVMid);
 			} catch (java.rmi.RemoteException e) {
+				// Best-effort.
 			}
 			SL.shutDown();
 		}
 	}
 
-	/**
-	 * APP: announce ready, then process requests; when idle and shutdown flagged, exit.
-	 * registerAppStopped keeps coordinator counts consistent with graceful scale-down.
-	 */
+	// APP worker: dequeue and process until coordinator signals shutdown.
 	private static void runAppWorker(ServerLib SL, CoordinatorInterface coord, int myVMid) {
 		try {
 			coord.registerAppReady(myVMid);
@@ -207,19 +214,20 @@ public class Server {
 				}
 			}
 		} catch (java.rmi.RemoteException e) {
+			// RMI failure; exit.
 		} finally {
 			try {
 				coord.registerAppStopped(myVMid);
 			} catch (java.rmi.RemoteException e) {
+				// Best-effort.
 			}
 			SL.shutDown();
 		}
 	}
 
+	// Scaler tick: FE queue report, smooth rate, scale APP/FE, optional scale-down.
 	private static void scaleLoop(ServerLib SL, Coordinator coordinator,
 			List<Integer> appVMs, List<Integer> feVMs) throws Exception {
-		final int minApps = 1;
-		final int maxApps = 10;
 		long lastAppScaleUp = 0;
 		long lastAppScaleDown = 0;
 		long lastFeScaleUp = 0;
@@ -234,7 +242,7 @@ public class Server {
 		final long scaleLoopStart = System.currentTimeMillis();
 
 		while (true) {
-			coordinator.reportFeQueue(1, SL.getQueueLength());
+			coordinator.reportFeQueue(COORDINATOR_HOST_VM_ID, SL.getQueueLength());
 			Thread.sleep(TICK_MS);
 
 			long now = System.currentTimeMillis();
@@ -242,7 +250,7 @@ public class Server {
 			long appUpCooldown = inBurstBootstrap ? BURST_APP_SCALE_UP_COOLDOWN_MS : APP_SCALE_UP_COOLDOWN_MS;
 			long feUpCooldown = inBurstBootstrap ? BURST_FE_SCALE_UP_COOLDOWN_MS : FE_SCALE_UP_COOLDOWN_MS;
 			int extraFeCap = inBurstBootstrap ? Math.max(MAX_EXTRA_FE, BURST_MAX_EXTRA_FE_CAP) : MAX_EXTRA_FE;
-			int appBatchCap = inBurstBootstrap ? BURST_APP_BATCH_CAP : 2;
+			int appBatchCap = inBurstBootstrap ? BURST_APP_BATCH_CAP : STEADY_STATE_APP_BATCH_CAP;
 
 			int appQueueSize = coordinator.getLocalQueueSize();
 			long oldestAgeMs = coordinator.getOldestRequestAgeMs();
@@ -257,7 +265,7 @@ public class Server {
 			int nowSubmitted = coordinator.getTotalSubmitted();
 			int delta = nowSubmitted - prevSubmitted;
 			prevSubmitted = nowSubmitted;
-			double instantRatePerSec = delta * (1000.0 / TICK_MS);
+			double instantRatePerSec = delta * ((double) MS_PER_SECOND / TICK_MS);
 			if (!rateInitialized) {
 				smoothedRate = instantRatePerSec;
 				rateInitialized = true;
@@ -273,21 +281,21 @@ public class Server {
 			boolean appStarvedByRate = committedApps > 0 && appQueueSize > 0
 					&& smoothedRate > committedApps * APP_REQ_PER_SEC_SCALE_UP_TARGET;
 			boolean needMoreApp = (appNeedsCapacity || appStarvedByRate)
-					&& committedApps < maxApps
+					&& committedApps < MAX_APPS
 					&& (now - lastAppScaleUp > appUpCooldown);
 
 			boolean didScaleUp = false;
 
 			if (needMoreApp) {
-				int targetApps = Math.min(maxApps,
+				int targetApps = Math.min(MAX_APPS,
 						Math.max(committedApps + 1,
 								(int) Math.ceil(smoothedRate / APP_REQ_PER_SEC_SCALE_UP_TARGET)));
 				int want = targetApps - committedApps;
 				want = Math.max(1, Math.min(appBatchCap, want));
-				want = Math.min(want, maxApps - committedApps);
+				want = Math.min(want, MAX_APPS - committedApps);
 				for (int i = 0; i < want; i++) {
 					int newId = SL.startVM();
-					coordinator.assignRole(newId, "APP");
+					coordinator.assignRole(newId, ROLE_APP);
 					synchronized (appVMs) {
 						appVMs.add(newId);
 					}
@@ -302,7 +310,7 @@ public class Server {
 			if (feIsBottleneck && committedExtraFe < extraFeCap
 					&& (now - lastFeScaleUp > feUpCooldown)) {
 				int feId = SL.startVM();
-				coordinator.assignRole(feId, "FRONTEND");
+				coordinator.assignRole(feId, ROLE_FRONTEND);
 				synchronized (feVMs) {
 					feVMs.add(feId);
 				}
@@ -312,22 +320,22 @@ public class Server {
 			}
 
 			if (!didScaleUp && ENABLE_SCALE_DOWN) {
-				boolean appQuiet = appQueueSize == 0 && oldestAgeMs < 150;
-				boolean feQuiet = totalFeQueue <= 1;
+				boolean appQuiet = appQueueSize == 0 && oldestAgeMs < SCALE_DOWN_MAX_OLDEST_AGE_MS;
+				boolean feQuiet = totalFeQueue <= SCALE_DOWN_FE_QUEUE_MAX;
 				double procCapacity = runningApps * APP_PROC_CAPACITY_FOR_SCALE_DOWN;
 
 				if (appQuiet && feQuiet && nowSubmitted > 0 && procCapacity > 0) {
-					if (smoothedRate < procCapacity * 0.5) {
+					if (smoothedRate < procCapacity * SCALE_DOWN_RATE_FRAC_FOR_RAW_COUNT) {
 						consecutiveAppLowRaw++;
 					} else {
 						consecutiveAppLowRaw = 0;
 					}
-					if (smoothedRate < procCapacity * 0.38) {
+					if (smoothedRate < procCapacity * SCALE_DOWN_RATE_FRAC_FOR_STRICT_COUNT) {
 						consecutiveAppLowStricter++;
 					} else {
 						consecutiveAppLowStricter = 0;
 					}
-					if (totalFeQueue <= 1) {
+					if (totalFeQueue <= SCALE_DOWN_FE_QUEUE_MAX) {
 						consecutiveFeLow++;
 					} else {
 						consecutiveFeLow = 0;
@@ -338,27 +346,25 @@ public class Server {
 					consecutiveFeLow = 0;
 				}
 
-				boolean canScaleDownApp = runningApps > minApps && bootingApps == 0
+				boolean canScaleDownApp = runningApps > MIN_APPS && bootingApps == 0
 						&& appQuiet && feQuiet
 						&& (now - lastAppScaleDown > APP_SCALE_DOWN_COOLDOWN_MS);
 				if (canScaleDownApp) {
 					if (consecutiveAppLowStricter >= CONSECUTIVE_APP_LOW_FOR_SCALE_DOWN) {
 						synchronized (appVMs) {
-							if (appVMs.size() > minApps) {
+							if (appVMs.size() > MIN_APPS) {
 								int vmToRemove = appVMs.remove(appVMs.size() - 1);
 								coordinator.markForShutdown(vmToRemove);
 								lastAppScaleDown = now;
 								consecutiveAppLowRaw = 0;
 								consecutiveAppLowStricter = 0;
-								if (SCALER_DEBUG_LOG) {
-									System.err.println("scaler: APP scale-down 1 vm=" + vmToRemove);
-								}
 							}
 						}
-					} else if (consecutiveAppLowRaw >= CONSECUTIVE_APP_LOW_FOR_SCALE_DOWN + 4) {
+					} else if (consecutiveAppLowRaw
+							>= CONSECUTIVE_APP_LOW_FOR_SCALE_DOWN + CONSECUTIVE_LOW_EXTRA_FOR_BATCH_APP_DOWN) {
 						synchronized (appVMs) {
-							if (appVMs.size() > minApps + 1) {
-								int n = Math.min(2, appVMs.size() - minApps);
+							if (appVMs.size() > MIN_APPS + 1) {
+								int n = Math.min(APP_SCALE_DOWN_BATCH_MAX, appVMs.size() - MIN_APPS);
 								for (int k = 0; k < n; k++) {
 									int vmToRemove = appVMs.remove(appVMs.size() - 1);
 									coordinator.markForShutdown(vmToRemove);
@@ -366,15 +372,13 @@ public class Server {
 								lastAppScaleDown = now;
 								consecutiveAppLowRaw = 0;
 								consecutiveAppLowStricter = 0;
-								if (SCALER_DEBUG_LOG) {
-									System.err.println("scaler: APP scale-down n=" + n);
-								}
 							}
 						}
 					}
 				}
 
-				boolean canScaleDownFe = appQuiet && totalFeQueue <= 1 && !feVMs.isEmpty()
+				boolean canScaleDownFe = appQuiet && totalFeQueue <= SCALE_DOWN_FE_QUEUE_MAX
+						&& !feVMs.isEmpty()
 						&& (now - lastFeScaleDown > FE_SCALE_DOWN_COOLDOWN_MS)
 						&& consecutiveFeLow >= CONSECUTIVE_FE_LOW_FOR_SCALE_DOWN;
 				if (canScaleDownFe) {
@@ -384,9 +388,6 @@ public class Server {
 							coordinator.markForShutdown(feRemove);
 							lastFeScaleDown = now;
 							consecutiveFeLow = 0;
-							if (SCALER_DEBUG_LOG) {
-								System.err.println("scaler: FE scale-down vm=" + feRemove);
-							}
 						}
 					}
 				}
@@ -395,22 +396,16 @@ public class Server {
 				consecutiveAppLowStricter = 0;
 				consecutiveFeLow = 0;
 			}
-
-			if (SCALER_DEBUG_LOG) {
-				System.err.printf(
-						"scaler appQ=%d oldest=%d feQ=%d rate=%.1f rApp=%d bApp=%d rFe=%d bFe=%d up=%b%n",
-						appQueueSize, oldestAgeMs, totalFeQueue, smoothedRate,
-						runningApps, bootingApps, runningExtraFe, bootingFe, didScaleUp);
-			}
 		}
 	}
 
+	// Wait for Coordinator stub (worker may start before registry is ready).
 	private static CoordinatorInterface lookupCoordinator(Registry registry) throws Exception {
 		while (true) {
 			try {
-				return (CoordinatorInterface) registry.lookup("Coordinator");
+				return (CoordinatorInterface) registry.lookup(COORDINATOR_REGISTRY_NAME);
 			} catch (Exception e) {
-				Thread.sleep(50);
+				Thread.sleep(REGISTRY_LOOKUP_RETRY_MS);
 			}
 		}
 	}
